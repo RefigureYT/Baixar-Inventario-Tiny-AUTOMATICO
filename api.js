@@ -13,10 +13,33 @@ const PORT = 3001;
 
 app.use(express.json()); // habilita leitura do body JSON
 
+const writeLog = console.log;
 const DESTINO = path.resolve(__dirname, 'relatorio_inventario.xls');
 let isRunning = false;
 let activeBrowser = null;
 let timeoutTimer = null;
+
+const { pipeline } = require('stream/promises');
+
+// Função para tentativa repetida em caso de falha
+async function retryOnFail(action, maxRetries, waitTime) {
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      await action();
+      writeLog(`Ação concluída com sucesso na tentativa ${attempt}.`);
+      return;
+    } catch (error) {
+      console.error(`Erro na tentativa ${attempt}: ${error.message}`);
+      if (attempt < maxRetries) {
+        writeLog(`Esperando ${waitTime / 1000} segundos antes de tentar novamente...`);
+        await new Promise(resolve => setTimeout(resolve, waitTime));
+      } else {
+        console.error('Máximo de tentativas atingido. Ação falhou.');
+        throw error;
+      }
+    }
+  }
+}
 
 app.post('/run', async (req, res) => {
   const { user, pass, url } = req.body;
@@ -61,107 +84,110 @@ app.post('/run', async (req, res) => {
     console.log('🌐 Acessando o site do Tiny...');
     await page.goto('https://erp.tiny.com.br/login', { waitUntil: 'networkidle2' });
 
-    console.log('📝 Preenchendo campo de usuário...');
-    await page.waitForSelector('#username');
-    await page.click('#username');
-    await page.keyboard.type(user, { delay: 100 });
+    await retryOnFail(async () => {
+      console.log('📝 Preenchendo campo de usuário...');
+      await page.waitForSelector('#username');
+      await page.click('#username');
+      await page.keyboard.type(user, { delay: 100 });
+      await new Promise(resolve => setTimeout(resolve, 1000));
+    }, 15, 2000)
+
+    await retryOnFail(async () => {
+      console.log('➡️ Clicando no botão "Avançar"...');
+      await page.evaluate(() => {
+        const btn = document.querySelector(
+          '#kc-content-wrapper > react-login-wc > section > div > main > aside.sc-jsJBEP.hfxeyl > div > button'
+        );
+        if (btn) btn.click();
+      });
+    }, 15, 2000)
+
     await new Promise(resolve => setTimeout(resolve, 1000));
+    
+    await retryOnFail(async () => {
+      console.log('🔒 Preenchendo a senha...');
+      await page.waitForSelector('#password', { timeout: 10000 });
+      await page.click('#password');
+      await page.keyboard.type(pass, { delay: 100 });
+      await new Promise(resolve => setTimeout(resolve, 1000));
+    }, 15, 2000)
 
-    console.log('➡️ Clicando no botão "Avançar"...');
-    await page.evaluate(() => {
-      const btn = document.querySelector(
-        '#kc-content-wrapper > react-login-wc > section > div > main > aside.sc-jsJBEP.hfxeyl > div > button'
-      );
-      if (btn) btn.click();
-    });
-
-    await new Promise(resolve => setTimeout(resolve, 1000));
-
-    console.log('🔒 Preenchendo a senha...');
-    await page.waitForSelector('#password', { timeout: 10000 });
-    await page.click('#password');
-    await page.keyboard.type(pass, { delay: 100 });
-    await new Promise(resolve => setTimeout(resolve, 1000));
-
-    console.log('🔓 Clicando no botão "Entrar"...');
-    await page.evaluate(() => {
-      const btn = document.querySelector(
-        '#kc-content-wrapper > react-login-wc > section > div > main > aside.sc-jsJBEP.hfxeyl > div > form > button'
-      );
-      if (btn) btn.click();
-    });
+    await retryOnFail(async () => {
+      console.log('🔓 Clicando no botão "Entrar"...');
+      await page.evaluate(() => {
+        const btn = document.querySelector(
+          '#kc-content-wrapper > react-login-wc > section > div > main > aside.sc-jsJBEP.hfxeyl > div > form > button'
+        );
+        if (btn) btn.click();
+      });
+    }, 15, 2000)    
 
     console.log('⏳ Aguardando possíveis modais...');
     await new Promise(resolve => setTimeout(resolve, 5000));
 
-    console.log('🕵️ Verificando se há sessão ativa anterior...');
-    const modalBtn = await page.$(
-      '#bs-modal-ui-popup > div > div > div > div.modal-footer > button.btn.btn-primary'
-    );
-    if (modalBtn) {
-      console.log('⚠️ Sessão anterior detectada! Clicando em "Entrar assim mesmo"...');
-      await modalBtn.click();
-      await new Promise(resolve => setTimeout(resolve, 2000));
-    } else {
-      console.log('✅ Nenhuma sessão anterior detectada.');
-    }
+    await retryOnFail(async () => {
+      console.log('🕵️ Verificando se há sessão ativa anterior...');
+      const modalBtn = await page.$(
+        '#bs-modal-ui-popup > div > div > div > div.modal-footer > button.btn.btn-primary'
+      );
+      if (modalBtn) {
+        console.log('⚠️ Sessão anterior detectada! Clicando em "Entrar assim mesmo"...');
+        await modalBtn.click();
+        await new Promise(resolve => setTimeout(resolve, 2000));
+      } else {
+        console.log('✅ Nenhuma sessão anterior detectada.');
+      }      
+    }, 15, 2000)
+
 
     console.log('🍪 Extraindo cookies da sessão...');
     const cookies = await page.cookies();
-    const cookieHeader = cookies.map(c => `${c.name}=${c.value}`).join('; ');
-
+    const cookieHeader = cookies.map(c => `${c.name}=${c.value}`).join('; ');    
+    
     const file = fs.createWriteStream(DESTINO);
     console.log('⬇️ Iniciando download do relatório...');
 
-    const options = {
-      headers: {
-        Cookie: cookieHeader,
-        'User-Agent': 'Mozilla/5.0'
-      }
-    };
+    await retryOnFail(async () => {
+      const options = {
+        headers: {
+          Cookie: cookieHeader,
+          'User-Agent': 'Mozilla/5.0'
+        }
+      };
 
-    https.get(url, options, (response) => {
-      if (response.statusCode !== 200) {
-        console.error('❌ Erro ao baixar:', response.statusCode);
-        return res.status(500).send('Erro ao baixar o arquivo.');
-      }
-
-      response.pipe(file);
-      file.on('finish', () => {
-        file.close();
-        console.log('✅ Download concluído com sucesso! Enviando arquivo...');
-        res.download(DESTINO, 'inventario.xls', async (err) => {
-          clearTimeout(timeoutTimer);
-          if (err) {
-            console.error('❌ Erro ao enviar arquivo:', err);
+      const response = await new Promise((resolve, reject) => {
+        https.get(url, options, (res) => {
+          if (res.statusCode !== 200) {
+            reject(new Error(`Status code: ${res.statusCode}`));
           } else {
-            console.log('🗑️ Removendo arquivo após envio...');
-            fs.unlinkSync(DESTINO);
+            resolve(res);
           }
-
-          if (activeBrowser) {
-            await activeBrowser.close();
-            console.log('🧯 Navegador fechado após envio.');
-          }
-          isRunning = false;
-          activeBrowser = null;
-        });
+        }).on('error', reject);
       });
-    });
 
-    // Timer de segurança: mata tudo após 10 minutos
-    timeoutTimer = setTimeout(async () => {
-      console.warn('⏰ Timeout! Fechando tudo...');
+      await pipeline(response, file);
+      console.log('✅ Download concluído com sucesso!');
+    }, 15, 2000);
+
+    // 👇 Só executa isso DEPOIS do download estar 100% concluído:
+    return res.download(DESTINO, 'inventario.xls', async (err) => {
+      clearTimeout(timeoutTimer);
+
+      if (err) {
+        console.error('❌ Erro ao enviar arquivo:', err);
+      } else {
+        console.log('🗑️ Removendo arquivo após envio...');
+        fs.unlinkSync(DESTINO);
+      }
+
       if (activeBrowser) {
         await activeBrowser.close();
-        activeBrowser = null;
+        console.log('🧯 Navegador fechado após envio.');
       }
-      if (fs.existsSync(DESTINO)) {
-        fs.unlinkSync(DESTINO);
-        console.warn('🗑️ Arquivo removido por timeout.');
-      }
+
       isRunning = false;
-    }, 10 * 60 * 1000);
+      activeBrowser = null;
+    });
   } catch (err) {
     console.error('❌ Erro geral:', err);
     if (activeBrowser) await activeBrowser.close();
@@ -172,6 +198,43 @@ app.post('/run', async (req, res) => {
   }
 });
 
+app.get('/encerrar', async (req, res) => {
+  if (!activeBrowser) {
+    return res.status(200).send('❌ Não há páginas no navegador aberto.');
+  }
+
+  try {
+    const pages = await activeBrowser.pages();
+    const total = pages.length;
+
+    let fechadas = 0;
+    let falhas = 0;
+
+    for (const page of pages) {
+      try {
+        await page.close();
+        fechadas++;
+      } catch (err) {
+        falhas++;
+        console.error(`Erro ao fechar página: ${err.message}`);
+      }
+    }
+
+    // Fecha o navegador inteiro depois de fechar as páginas
+    await activeBrowser.close();
+    activeBrowser = null;
+    isRunning = false;
+    clearTimeout(timeoutTimer);
+
+    const msg = `🧯 Foram encontradas ${total} páginas abertas, ${fechadas} foram fechadas com sucesso e ${falhas} falharam.`;
+    console.log(msg);
+    res.status(200).send(msg);
+  } catch (err) {
+    console.error('Erro ao encerrar navegador:', err.message);
+    res.status(500).send('Erro ao encerrar navegador.');
+  }
+});
+
 app.listen(PORT, () => {
-  console.log(`🚀 API rodando em http://192.168.15.177:${PORT}/run`);
+  console.log(`🚀 API rodando em http://192.168.15.177:${PORT}/run (POST) \n body: \n{ \n"user":"{user}", \n"pass":"pass", \n"url":"url" \n} \n\n ########################################################## \n\n 🚀 API rodando em http://192.168.15.177:${PORT}/encerrar (GET)`);
 });
